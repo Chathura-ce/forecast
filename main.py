@@ -86,7 +86,7 @@ def predict(req: PredictRequest):
 
     # 6) Serialize and return exactly `periods` forecast points
     out = [
-        {"ds": ds.strftime("%Y-%m-%d"), "yhat": float(val)}
+        {"ds": ds.strftime("%Y-%m-%d"), "yhat": round(float(val), 2) }
         for ds, val in ens.items()
     ]
     return {"item": req.item, "predictions": out}
