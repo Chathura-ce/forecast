@@ -3,6 +3,9 @@ uvicorn
 pandas
 numpy
 scikit-learn
+statsmodels
 joblib
 prophet
 lightgbm
+tensorflow
+joblib
