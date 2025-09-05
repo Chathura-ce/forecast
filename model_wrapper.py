@@ -1,88 +1,59 @@
-# forecast-api/model_wrapper.py
-
+# model_wrapper.py
 import numpy as np
 import pandas as pd
+import tensorflow as tf
 
-def make_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Given a DataFrame with ['ds','y'], returns
-    a DataFrame with columns: ds, y, lag1, lag2, lag4, month, sin52, cos52
-    """
-    out = df.copy()
-    out["lag1"]  = out["y"].shift(1)
-    out["lag2"]  = out["y"].shift(2)
-    out["lag4"]  = out["y"].shift(4)
-    out["month"] = out["ds"].dt.month
+WIN_STATS     = 730      # window for mean/std calculation
+H_DEFAULT     = 30
+SD_FLOOR_ABS  = 5.0
+SD_FLOOR_REL  = 0.015
+CLIP_NORM     = 10.0
 
-    wk = out["ds"].dt.isocalendar().week.astype(int)
-    out["sin52"] = np.sin(2 * np.pi * wk / 52)
-    out["cos52"] = np.cos(2 * np.pi * wk / 52)
+def sd_eff(mu: float, sd: float) -> float:
+    return max(float(sd), SD_FLOOR_ABS, abs(float(mu)) * SD_FLOOR_REL)
 
-    return out.dropna().reset_index(drop=True)
+class ModelBundle:
+    def __init__(self, model_path: str):
+        self.model = tf.keras.models.load_model(model_path, compile=False)
+        # infer required input steps (timesteps) and output length
+        in_shape  = self.model.input_shape   # (None, steps_in, 1)
+        out_shape = self.model.output_shape  # (None, steps_out) or (None, steps_out, 1)
+        self.steps_in  = int(in_shape[1])
+        self.steps_out = int(out_shape[-1])
 
+    def predict_next(
+        self,
+        daily_series: pd.Series,           # pd.DatetimeIndex (daily), float values
+        horizon: int = H_DEFAULT
+    ) -> pd.Series:
 
-class ForecastWrapper:
-    """
-    Wraps one of: 'prophet', 'lgbm', 'arima', 'ensemble'
-    """
-    def __init__(self, model_type, prophet=None, lgbm=None, arima=None, w_prophet=0.6):
-        self.type      = model_type
-        self.prophet   = prophet
-        self.lgbm      = lgbm
-        self.arima     = arima
-        self.w_prophet = w_prophet
-        self.w_lgbm    = 1 - w_prophet
+        if len(daily_series) < max(WIN_STATS, self.steps_in):
+            raise ValueError(
+                f"Need at least {max(WIN_STATS, self.steps_in)} daily points, got {len(daily_series)}"
+            )
 
-    def predict(self, hist_df: pd.DataFrame, periods: int) -> pd.Series:
-        # 1) Build future dates (next N Mondays)
-        last   = hist_df["ds"].max()
-        future = pd.DataFrame({
-            "ds": [ last + pd.Timedelta(weeks=i+1) for i in range(periods) ]
-        }).set_index("ds")
+        # --- stats on a long window for stable μ/σ ---
+        hist_stats = daily_series.iloc[-WIN_STATS:]
+        mu  = float(hist_stats.mean())
+        sd  = float(hist_stats.std())
+        sde = sd_eff(mu, sd)
 
-        # 2) ARIMA-only
-        if self.type == "arima":
-            preds = self.arima.forecast(periods)
-            return pd.Series(preds, index=future.index)
+        # --- model input = last `steps_in` points, normalized the same way ---
+        x_seq = daily_series.iloc[-self.steps_in:]
+        x = ((x_seq.values - mu) / sde).reshape(1, self.steps_in, 1).astype("float32")
 
-        # 3) LGBM-only (use make_features to build correct feature set)
-        if self.type == "lgbm":
-            hist_tmp = hist_df.copy()
-            lgb_preds = []
-            for ds in future.index:
-                feat_df = make_features(hist_tmp)
-                X_row   = feat_df.drop(["ds","y"], axis=1).iloc[[-1]]
-                yhat_l  = self.lgbm.predict(X_row)[0]
-                lgb_preds.append(yhat_l)
-                # append prediction back into history
-                hist_tmp = pd.concat([
-                    hist_tmp,
-                    pd.DataFrame({"ds":[ds], "y":[yhat_l]})
-                ], ignore_index=True)
-            return pd.Series(lgb_preds, index=future.index)
+        y_norm = self.model.predict(x, verbose=0).reshape(-1)
+        y_norm = np.clip(y_norm, -CLIP_NORM, CLIP_NORM)
 
-        # 4) Prophet (for 'prophet' & 'ensemble')
-        ph = (
-            self.prophet
-                .predict(future.reset_index())
-                .set_index("ds")["yhat"]
-        )
-        if self.type == "prophet":
-            return ph
+        # some models emit more than we asked; cap to horizon
+        steps = int(max(1, min(horizon, len(y_norm), self.steps_out)))
+        y_hat = (y_norm[:steps] * sde + mu).astype("float64")
 
-        # 5) Ensemble: recursive LGBM + blend
-        hist_tmp = hist_df.copy()
-        lgb_preds = []
-        for ds in ph.index:
-            feat_df = make_features(hist_tmp)
-            X_row   = feat_df.drop(["ds","y"], axis=1).iloc[[-1]]
-            yhat_l  = self.lgbm.predict(X_row)[0]
-            lgb_preds.append(yhat_l)
-            hist_tmp = pd.concat([
-                hist_tmp,
-                pd.DataFrame({"ds":[ds], "y":[yhat_l]})
-            ], ignore_index=True)
-        lg = pd.Series(lgb_preds, index=ph.index)
+        start = daily_series.index[-1] + pd.Timedelta(days=1)
+        idx   = pd.date_range(start, periods=steps, freq="D")
+        return pd.Series(y_hat, index=idx, name="yhat")
 
-        # blend Prophet + LGBM
-        return self.w_prophet * ph + self.w_lgbm * lg
+def weekly_average(daily_fc: pd.Series) -> pd.Series:
+    df = daily_fc.to_frame("yhat").copy()
+    df["week"] = df.index - pd.to_timedelta(df.index.dayofweek, unit="D")
+    return df.groupby("week")["yhat"].mean()
